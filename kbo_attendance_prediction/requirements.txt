@@ -1,0 +1,13 @@
+﻿pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+tensorflow
+streamlit
+plotly
+ollama
+faiss-cpu
+nbformat
+nbconvert
+python-pptx

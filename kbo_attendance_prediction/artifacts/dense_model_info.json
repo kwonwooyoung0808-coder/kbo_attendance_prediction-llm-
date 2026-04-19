@@ -1,0 +1,8 @@
+{
+  "model": "Dense",
+  "mae": 3863.109624056208,
+  "rmse": 4794.803560030855,
+  "baseline_mae": 4366.261193189496,
+  "baseline_rmse": 5254.312661810449,
+  "sample_prediction": 17026
+}

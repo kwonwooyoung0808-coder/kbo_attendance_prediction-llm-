@@ -1,0 +1,8 @@
+{
+  "model": "GRU",
+  "mae": 4757.994635687934,
+  "rmse": 5638.790241026783,
+  "baseline_mae": 4771.157763069059,
+  "baseline_rmse": 5649.279726004666,
+  "sample_prediction": 16028
+}

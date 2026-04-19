@@ -1,0 +1,11 @@
+[
+  "home_team_enc",
+  "away_team_enc",
+  "stadium_enc",
+  "month",
+  "weekday_num",
+  "is_weekend",
+  "is_holiday",
+  "is_rival_match",
+  "season"
+]
