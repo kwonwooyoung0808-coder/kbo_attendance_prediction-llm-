@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import pickle
 import re
 
@@ -29,6 +30,7 @@ FEATURES_FILE = ARTIFACT_DIR / "feature_cols.json"
 LSTM_SCALER_FILE = ARTIFACT_DIR / "lstm_target_scaler.pkl"
 GRU_SCALER_FILE = ARTIFACT_DIR / "gru_target_scaler.pkl"
 OLLAMA_MODEL = "gemma2:latest"
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "").strip()
 CURRENT_SEASON = 2026
 CURRENT_DATE = pd.Timestamp("2026-04-16")
 DENSE_MODEL_MAE = 3863
@@ -388,7 +390,7 @@ def load_data() -> pd.DataFrame:
 def load_dense_artifacts():
     if not (DENSE_MODEL_PATH.exists() and ENCODERS_FILE.exists() and SCALER_FILE.exists() and FEATURES_FILE.exists()):
         return None, None, None, None
-    model = load_model(DENSE_MODEL_PATH)
+    model = load_model(DENSE_MODEL_PATH, compile=False)
     with open(ENCODERS_FILE, "rb") as f:
         encoders = pickle.load(f)
     with open(SCALER_FILE, "rb") as f:
@@ -399,8 +401,8 @@ def load_dense_artifacts():
 
 @st.cache_resource
 def load_sequence_artifacts():
-    lstm_model = load_model(LSTM_MODEL_PATH) if LSTM_MODEL_PATH.exists() else None
-    gru_model = load_model(GRU_MODEL_PATH) if GRU_MODEL_PATH.exists() else None
+    lstm_model = load_model(LSTM_MODEL_PATH, compile=False) if LSTM_MODEL_PATH.exists() else None
+    gru_model = load_model(GRU_MODEL_PATH, compile=False) if GRU_MODEL_PATH.exists() else None
     lstm_scaler = None
     gru_scaler = None
     if LSTM_SCALER_FILE.exists():
@@ -471,6 +473,7 @@ def predict_dense(home_team: str, away_team: str, month: int, weekday: str, is_h
 
 def get_recent_sequence(home_team: str, season: int, seq_len: int = 5):
     df = load_data()
+    df = df[df["attendance"].notna()].copy()
     team_df = df[(df["home_team"] == home_team) & (df["season"] == season)].sort_values("date")
     if len(team_df) < seq_len:
         team_df = df[df["home_team"] == home_team].sort_values("date")
@@ -679,6 +682,29 @@ def get_ticketing_reasons(row: pd.Series) -> list[str]:
     return reasons
 
 
+def build_rule_based_ticketing_answer(question: str, candidates: pd.DataFrame) -> str:
+    top = candidates.head(3).reset_index(drop=True)
+    best = top.iloc[0]
+    lines = [
+        f"조건에 가장 잘 맞는 경기는 {best['date']}({best['weekday']}) {best['away_team']} vs {best['home_team']} 경기입니다.",
+        f"{best['stadium']} 기준 예상 관중은 {best['prediction']:,}명, 예상 점유율은 {best['occupancy']}%로 {best['ticket_status']}으로 분류됩니다.",
+    ]
+
+    if len(top) > 1:
+        alternatives = ", ".join(
+            f"{row['date']} {row['away_team']} vs {row['home_team']}({row['occupancy']}%)"
+            for _, row in top.iloc[1:].iterrows()
+        )
+        lines.append(f"비교 후보로는 {alternatives}도 함께 볼 만합니다.")
+
+    reason_text = " ".join(get_ticketing_reasons(best))
+    lines.append(reason_text)
+    lines.append(
+        f"이 답변은 Dense 관중 예측과 일정 데이터 기반이며, 평균 절대 오차가 약 {DENSE_MODEL_MAE:,}명 있을 수 있습니다. 실제 예매 가능 좌석은 구단 예매처에서 다시 확인해 주세요."
+    )
+    return " ".join(lines)
+
+
 def render_ticketing_reason_cards(candidates: pd.DataFrame):
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.markdown("<div class='section-title'>추천 근거 요약</div>", unsafe_allow_html=True)
@@ -702,7 +728,10 @@ def render_ticketing_reason_cards(candidates: pd.DataFrame):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def ask_ticketing_llm(question: str, context: str) -> str:
+def ask_ticketing_llm(question: str, context: str, candidates: pd.DataFrame) -> tuple[str, bool]:
+    if not OLLAMA_HOST:
+        return build_rule_based_ticketing_answer(question, candidates), False
+
     system_prompt = (
         "너는 KBO 경기 추천 상담 전문가다. "
         "제공된 경기 일정과 예측 관중, 점유율, 공휴일 여부, 라이벌전 여부만 근거로 답변한다. "
@@ -711,14 +740,15 @@ def ask_ticketing_llm(question: str, context: str) -> str:
         "점유율이 높으면 온라인 예매와 취소표 확인을 권장하고, 여유로운 관람을 원하면 점유율이 낮은 경기를 추천해라. "
         "한국어로 4~6문장 이내로 답변한다."
     )
-    response = ollama.chat(
+    client = ollama.Client(host=OLLAMA_HOST, timeout=12)
+    response = client.chat(
         model=OLLAMA_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"질문: {question}\n\n경기 예측 데이터:\n{context}"},
         ],
     )
-    return response["message"]["content"]
+    return response["message"]["content"], True
 
 
 def render_llm_ticketing_page():
@@ -758,16 +788,21 @@ def render_llm_ticketing_page():
             return
 
         context = make_ticketing_context(candidates)
-        with st.spinner("Ollama가 추천 근거를 정리하는 중입니다..."):
+        spinner_text = "Ollama가 추천 근거를 정리하는 중입니다..." if OLLAMA_HOST else "추천 근거를 정리하는 중입니다..."
+        with st.spinner(spinner_text):
             try:
-                answer = ask_ticketing_llm(question, context)
+                answer, used_ollama = ask_ticketing_llm(question, context, candidates)
             except Exception as exc:
-                st.error(f"Ollama 응답을 생성하지 못했습니다: {exc}")
-                return
+                answer = build_rule_based_ticketing_answer(question, candidates)
+                used_ollama = False
+                st.warning(f"Ollama 연결이 되지 않아 기본 추천 답변으로 표시합니다. ({exc})")
 
         st.markdown("<div class='panel'>", unsafe_allow_html=True)
         st.markdown("<div class='section-title'>AI 상담 답변</div>", unsafe_allow_html=True)
-        st.caption("검색된 일정과 예측 점유율을 근거로 생성한 답변입니다.")
+        if used_ollama:
+            st.caption("Ollama와 검색된 일정, 예측 점유율을 근거로 생성한 답변입니다.")
+        else:
+            st.caption("배포 환경에서도 동작하도록 일정과 예측 점유율을 근거로 생성한 기본 답변입니다.")
         st.write(answer)
         st.markdown("</div>", unsafe_allow_html=True)
 
